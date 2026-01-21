@@ -1,4 +1,19 @@
-# AI Mock Interview Generator
+# Interview Buddy
+
+A full-stack interview preparation app built with React, Vite, Tailwind CSS, and Firebase Firestore.
+
+**Live Demo**: https://interview-buddy-usfc.vercel.app 🚀
+
+## Features
+- Mock interview questions fetched from Firebase.
+- Responsive design.
+- Categories and real-time data.
+
+## Tech Stack
+- Frontend: React + Vite + Tailwind
+- Database: Firebase Firestore
+
+To run locally: `npm install` → `npm run dev`# AI Mock Interview Generator
 
 A React + TypeScript application that generates personalized mock interview questions using Google's Generative AI. Perfect for job seekers preparing for technical and behavioral interviews.
 
