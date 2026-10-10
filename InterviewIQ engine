@@ -1,0 +1,174 @@
+// InterviewIQ C++ engine - starter skeleton
+// Build: g++ -std=c++17 -O2 -pthread interviewbuddy_engine.cpp -o engine
+//
+// Parts:
+//   1. tokenize()       - lowercase + split on non-alphanumerics
+//   2. InvertedIndex    - term -> postings, TF-IDF cosine similarity,
+//                         guarded by std::shared_mutex (many readers, one writer)
+//   3. ThreadPool       - fixed workers + task queue (mutex + condition_variable)
+//   4. main()           - demo: score several answers in parallel
+ 
+#include <cctype>
+#include <cmath>
+#include <condition_variable>
+#include <functional>
+#include <future>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <shared_mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+ 
+static std::vector<std::string> tokenize(const std::string& text) {
+    std::vector<std::string> tokens;
+    std::string cur;
+    for (unsigned char c : text) {
+        if (std::isalnum(c)) {
+            cur.push_back(static_cast<char>(std::tolower(c)));
+        } else if (!cur.empty()) {
+            tokens.push_back(cur);
+            cur.clear();
+        }
+    }
+    if (!cur.empty()) tokens.push_back(cur);
+    return tokens;
+}
+ 
+class InvertedIndex {
+public:
+    // Writer: exclusive lock. Returns the new document id.
+    int add_document(const std::string& text) {
+        auto tokens = tokenize(text);
+        std::unordered_map<std::string, int> tf;
+        for (const auto& t : tokens) tf[t]++;
+ 
+        std::unique_lock<std::shared_mutex> lock(mu_);
+        int id = doc_count_++;
+        for (const auto& [term, count] : tf) postings_[term].push_back({id, count});
+        doc_tf_.push_back(std::move(tf));
+        return id;
+    }
+ 
+    // Reader: shared lock, so many threads can score at the same time.
+    double similarity(const std::string& query, int doc_id) const {
+        std::unordered_map<std::string, int> qtf;
+        for (const auto& t : tokenize(query)) qtf[t]++;
+ 
+        std::shared_lock<std::shared_mutex> lock(mu_);
+        if (doc_id < 0 || doc_id >= doc_count_) return 0.0;
+        const auto& dtf = doc_tf_[doc_id];
+ 
+        double dot = 0.0, qnorm = 0.0, dnorm = 0.0;
+        for (const auto& [term, count] : qtf) {
+            double w = count * idf_locked(term);
+            qnorm += w * w;
+            auto it = dtf.find(term);
+            if (it != dtf.end()) dot += w * (it->second * idf_locked(term));
+        }
+        for (const auto& [term, count] : dtf) {
+            double w = count * idf_locked(term);
+            dnorm += w * w;
+        }
+        if (qnorm == 0.0 || dnorm == 0.0) return 0.0;
+        return dot / (std::sqrt(qnorm) * std::sqrt(dnorm));
+    }
+ 
+private:
+    // Caller must already hold mu_.
+    double idf_locked(const std::string& term) const {
+        auto it = postings_.find(term);
+        double df = (it == postings_.end()) ? 0.0 : static_cast<double>(it->second.size());
+        return std::log((1.0 + doc_count_) / (1.0 + df)) + 1.0;
+    }
+ 
+    mutable std::shared_mutex mu_;
+    int doc_count_ = 0;
+    std::unordered_map<std::string, std::vector<std::pair<int, int>>> postings_;  // term -> (doc, tf)
+    std::vector<std::unordered_map<std::string, int>> doc_tf_;                      // per-doc term counts
+};
+ 
+class ThreadPool {
+public:
+    explicit ThreadPool(size_t n) {
+        for (size_t i = 0; i < n; ++i) workers_.emplace_back([this] { worker_loop(); });
+    }
+ 
+    ~ThreadPool() {
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& w : workers_) w.join();
+    }
+ 
+    template <class F>
+    auto submit(F f) -> std::future<decltype(f())> {
+        using R = decltype(f());
+        auto task = std::make_shared<std::packaged_task<R()>>(std::move(f));
+        auto fut = task->get_future();
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            tasks_.push([task] { (*task)(); });
+        }
+        cv_.notify_one();
+        return fut;
+    }
+ 
+private:
+    void worker_loop() {
+        for (;;) {
+            std::function<void()> job;
+            {
+                std::unique_lock<std::mutex> lk(m_);
+                cv_.wait(lk, [this] { return stop_ || !tasks_.empty(); });
+                if (stop_ && tasks_.empty()) return;  // drain queue, then exit
+                job = std::move(tasks_.front());
+                tasks_.pop();
+            }
+            job();
+        }
+    }
+ 
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::queue<std::function<void()>> tasks_;
+    bool stop_ = false;
+    std::vector<std::thread> workers_;
+};
+ 
+int main() {
+    InvertedIndex index;
+    int d0 = index.add_document("A mutex protects shared data so only one thread enters the critical section at a time");
+    int d1 = index.add_document("An index speeds up queries by avoiding a full table scan");
+    int d2 = index.add_document("Deadlock happens when threads wait on each other's locks forever");
+ 
+    std::vector<std::string> answers = {
+        "a mutex lets one thread at a time access shared data",
+        "indexes avoid scanning the whole table",
+        "threads blocked waiting for each other's locks cause deadlock",
+    };
+    std::vector<int> refs = {d0, d1, d2};
+ 
+    ThreadPool pool(4);
+    std::vector<std::future<double>> results;
+    for (size_t i = 0; i < answers.size(); ++i) {
+        results.push_back(pool.submit([&index, &answers, &refs, i] {
+            return index.similarity(answers[i], refs[i]);
+        }));
+    }
+    for (size_t i = 0; i < results.size(); ++i)
+        std::cout << "answer " << i << " similarity = " << results[i].get() << "\n";
+ 
+    // TODO 1: load reference answers from your existing InterviewBuddy dataset (JSON/CSV).
+    // TODO 2: add a TCP server (or stdin/stdout mode) so the Java backend can call this engine.
+    // TODO 3: benchmark at 1, 4 and 8 threads vs your Java version; record req/sec and latency.
+    // TODO 4: try a std::mutex version of the index and compare against shared_mutex.
+    return 0;
+}
+ 
